@@ -3,23 +3,13 @@ name: Build Realme Q5 GKI Kernel
 on:
   workflow_dispatch:
     inputs:
-      kernel_branch:
-        description: 'Kernel source branch'
-        required: false
-        default: 'master'
-        type: string
       enable_kernelsu:
         description: 'Enable KernelSU'
         required: false
         default: true
         type: boolean
-      enable_susfs:
-        description: 'Enable SUSFS'
-        required: false
-        default: false
-        type: boolean
       lto_mode:
-        description: 'LTO mode'
+        description: 'LTO mode (thin/full/none)'
         required: false
         default: 'thin'
         type: choice
@@ -31,11 +21,9 @@ on:
 env:
   ARCH: arm64
   SUBARCH: arm64
-  KERNEL_SOURCE: https://github.com/realme-kernel-opensource/realme_9pro-5G_9-5G_V25_Q5-AndroidS-kernel-source
-  KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
-  DEVICE_NAME: Realme Q5
+  KERNEL_REPO: https://github.com/realme-kernel-opensource/realme_9pro-5G_9-5G_V25_Q5-AndroidS-kernel-source
+  DEVICE: Realme Q5
   CODENAME: oscar
-  SOC: sm6375
 
 jobs:
   build:
@@ -44,267 +32,236 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 8192
-          temp-reserve-mb: 2048
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
+      - name: Free disk space
+        run: |
+          echo "=== Maximizing build space ==="
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo apt-get clean
+          df -h
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential cpio curl flex \
-            git libncurses-dev libssl-dev \
-            libelf-dev lzop python3 unzip xz-utils \
-            zstd rsync ca-certificates wget \
-            pahole dwarves zip gcc g++
-          
-          echo "=== Installed dependencies ==="
-          gcc --version
-          clang --version || echo "Clang not installed yet"
+            bc bison build-essential cpio curl flex git \
+            libssl-dev libncurses-dev libelf-dev \
+            python3 python3-pip python3-venv \
+            lzop zip unzip xz-utils zstd wget \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
-      - name: Setup Clang toolchain
+      - name: Setup AOSP Clang
         run: |
-          echo "=== Setting up AOSP Clang toolchain ==="
-          mkdir -p $HOME/toolchain
-          cd $HOME/toolchain
-          
-          # Download AOSP Clang (r416183b is stable for 5.10 kernels)
-          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android13-release/clang-r416183b.tar.gz"
-          wget -q "$CLANG_URL" -O clang.tar.gz || echo "Using system clang"
-          
-          if [ -f clang.tar.gz ]; then
-            mkdir -p clang
-            tar -xf clang.tar.gz -C clang/
-            echo "$HOME/toolchain/clang/bin" >> $GITHUB_PATH
-            export PATH="$HOME/toolchain/clang/bin:$PATH"
+          echo "=== Setting up Clang toolchain ==="
+          CLANG_VERSION="r487747c"
+          CLANG_DIR="${HOME}/clang"
+          mkdir -p "${CLANG_DIR}"
+
+          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-${CLANG_VERSION}.tar.gz" \
+            -O /tmp/clang.tar.gz || {
+            echo "Primary URL failed, trying mirror..."
+            wget -q "https://github.com/nicedroid/aosp-clang/releases/download/clang-${CLANG_VERSION}/clang-${CLANG_VERSION}-linux-x86_64.tar.zst" \
+              -O /tmp/clang.tar.zst
+            zstd -d /tmp/clang.tar.zst -o /tmp/clang.tar
+          }
+
+          if [ -f /tmp/clang.tar ]; then
+            tar -xf /tmp/clang.tar -C "${CLANG_DIR}/"
+            echo "${CLANG_DIR}/bin" >> $GITHUB_PATH
+            echo "Clang installed from AOSP"
           else
-            sudo apt-get install -y clang lld
+            echo "Falling back to Ubuntu clang"
+            sudo apt-get install -y clang lld llvm
           fi
-          
-          # Download GCC cross compiler
-          wget -q https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/android13-release.tar.gz -O gcc.tar.gz || echo "Using system gcc"
-          
-          if [ -f gcc.tar.gz ]; then
-            mkdir -p gcc
-            tar -xf gcc.tar.gz -C gcc/
-            echo "$HOME/toolchain/gcc/bin" >> $GITHUB_PATH
-            export PATH="$HOME/toolchain/gcc/bin:$PATH"
-          fi
-          
-          echo "=== Toolchain setup complete ==="
 
-      - name: Sync kernel source
-        run: |
-          echo "=== Syncing kernel source ==="
-          mkdir -p build
-          cd build
-          
-          # Install repo tool
-          curl https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
-          chmod a+x /usr/local/bin/repo
-          
-          # Initialize and sync kernel source
-          repo init -u https://android.googlesource.com/kernel/manifest -b common-android12-5.10 --no-repo-verify --depth=1
-          repo sync --force-sync --no-clone-bundle --no-tags -f -c -j$(nproc)
-          
-          echo "=== Kernel source synced ==="
+          rm -f /tmp/clang.tar /tmp/clang.tar.zst
 
-      - name: Patch kernel for Realme Q5
+      - name: Clone kernel source
         run: |
-          echo "=== Patching kernel for Realme Q5 ==="
-          cd build
-          
-          # Clone Realme kernel source
-          git clone --depth=1 $KERNEL_SOURCE -b $KERNEL_BRANCH realme-kernel
-          
-          # Copy device tree and configs
-          if [ -d realme-kernel/arch/arm64/configs ]; then
-            cp -r realme-kernel/arch/arm64/configs/* common/arch/arm64/configs/ || true
-          fi
-          
-          # Copy board files
-          if [ -d realme-kernel/arch/arm64/boot/dts ]; then
-            cp -r realme-kernel/arch/arm64/boot/dts/* common/arch/arm64/boot/dts/ || true
-          fi
-          
-          # Copy drivers
-          if [ -d realme-kernel/drivers ]; then
-            rsync -av --ignore-existing realme-kernel/drivers/ common/drivers/ || true
-          fi
-          
-          echo "=== Kernel patched ==="
+          echo "=== Cloning kernel source ==="
+          git clone --depth=1 ${KERNEL_REPO} -b master kernel
+          echo "Kernel source cloned"
 
       - name: Install KernelSU
         if: ${{ github.event.inputs.enable_kernelsu == 'true' }}
         run: |
           echo "=== Installing KernelSU ==="
-          cd build/common
-          
-          # Install KernelSU
+          cd kernel
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
-          
           echo "=== KernelSU installed ==="
 
       - name: Configure kernel
         run: |
           echo "=== Configuring kernel ==="
-          cd build/common
-          
-          # Find available defconfig
-          echo "Available defconfigs:"
-          ls arch/arm64/configs/ | grep -i gki || ls arch/arm64/configs/ | head -20
-          
-          # Try to find the correct defconfig for sm6375
-          DEFCONFIG=""
-          if [ -f "arch/arm64/configs/gki_defconfig" ]; then
-            DEFCONFIG="gki_defconfig"
-          elif [ -f "arch/arm64/configs/sm6375_gki_defconfig" ]; then
-            DEFCONFIG="sm6375_gki_defconfig"
-          elif [ -f "arch/arm64/configs/vendor/sm6375_GKI.config" ]; then
-            DEFCONFIG="gki_defconfig"
-          else
-            echo "Using default gki_defconfig"
-            DEFCONFIG="gki_defconfig"
+          cd kernel
+
+          # List available defconfigs
+          echo "Available configs in arch/arm64/configs/:"
+          ls arch/arm64/configs/
+
+          # Check defconfig exists
+          if [ ! -f "arch/arm64/configs/gki_defconfig" ]; then
+            echo "ERROR: gki_defconfig not found!"
+            exit 1
           fi
-          
-          echo "Using defconfig: $DEFCONFIG"
-          
-          # Generate .config
-          make O=out ARCH=$ARCH CC=clang LLVM=1 LLVM_IAS=1 $DEFCONFIG
-          
-          # Enable KernelSU options if enabled
+
+          # Add KernelSU config if enabled
           if [ "${{ github.event.inputs.enable_kernelsu }}" == "true" ]; then
-            echo "CONFIG_KSU=y" >> out/.config
-            echo "CONFIG_KSU_MANAGER=y" >> out/.config
+            echo "CONFIG_KSU=y" >> arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_MANAGER=y" >> arch/arm64/configs/gki_defconfig
+            echo "Added KernelSU config"
           fi
-          
-          # Update config
-          make O=out ARCH=$ARCH CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
-          
+
+          # Generate .config
+          make O=out ARCH=${ARCH} gki_defconfig
+
+          # Run olddefconfig to resolve any new options
+          make O=out ARCH=${ARCH} CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+
           echo "=== Kernel configured ==="
 
       - name: Build kernel
         run: |
           echo "=== Building kernel ==="
-          cd build/common
-          
-          # Set LTO mode
+          cd kernel
+
+          # LTO settings
           LTO="${{ github.event.inputs.lto_mode }}"
           if [ "$LTO" == "none" ]; then
             sed -i 's/CONFIG_LTO=y/# CONFIG_LTO is not set/' out/.config
+            sed -i 's/CONFIG_LTO_THIN=y/# CONFIG_LTO_THIN is not set/' out/.config
           elif [ "$LTO" == "full" ]; then
             sed -i 's/CONFIG_LTO_THIN=y/CONFIG_LTO_FULL=y/' out/.config
           fi
-          
-          # Build kernel
-          echo "Starting kernel build..."
+
+          # Re-run olddefconfig after LTO changes
+          make O=out ARCH=${ARCH} CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+
+          # Build kernel image
+          echo "Starting build..."
           make -j$(nproc) O=out \
-            ARCH=$ARCH \
+            ARCH=${ARCH} \
             CC=clang \
             LLVM=1 \
             LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            Image 2>&1 | tee build.log
-          
-          echo "=== Kernel build complete ==="
+            Image 2>&1 | tee build.log || {
+            echo "=== Build failed, showing last 100 lines ==="
+            tail -100 build.log
+            exit 1
+          }
 
-      - name: Check build output
+          echo "=== Build complete ==="
+
+      - name: Verify build output
         run: |
-          echo "=== Checking build output ==="
-          cd build/common
-          
+          echo "=== Verifying build output ==="
+          cd kernel
+
           if [ -f "out/arch/arm64/boot/Image" ]; then
-            echo "✓ Kernel Image built successfully"
+            echo "Image found"
             ls -lh out/arch/arm64/boot/Image
           elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
-            echo "✓ Kernel Image.gz built successfully"
+            echo "Image.gz found"
             ls -lh out/arch/arm64/boot/Image.gz
           else
-            echo "✗ Kernel build failed"
-            echo "=== Build log tail ==="
-            tail -50 build.log || true
+            echo "ERROR: No kernel image found!"
+            echo "Files in out/arch/arm64/boot/:"
+            ls -la out/arch/arm64/boot/ 2>/dev/null || echo "Directory not found"
             exit 1
           fi
 
-      - name: Package with AnyKernel3
+      - name: Package AnyKernel3
         run: |
-          echo "=== Packaging with AnyKernel3 ==="
-          cd build
-          
+          echo "=== Packaging ==="
+          cd kernel
+
           # Clone AnyKernel3
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
           cd AnyKernel3
-          
-          # Clean unnecessary files
           rm -rf .git README.md
-          
+
           # Copy kernel image
-          if [ -f "../common/out/arch/arm64/boot/Image" ]; then
-            cp ../common/out/arch/arm64/boot/Image .
-          elif [ -f "../common/out/arch/arm64/boot/Image.gz" ]; then
-            cp ../common/out/arch/arm64/boot/Image.gz .
+          if [ -f "../out/arch/arm64/boot/Image" ]; then
+            cp ../out/arch/arm64/boot/Image .
+          elif [ -f "../out/arch/arm64/boot/Image.gz" ]; then
+            cp ../out/arch/arm64/boot/Image.gz .
           fi
-          
+
           # Copy dtbo if exists
-          if [ -f "../common/out/arch/arm64/boot/dtbo.img" ]; then
-            cp ../common/out/arch/arm64/boot/dtbo.img .
+          if [ -f "../out/arch/arm64/boot/dtbo.img" ]; then
+            cp ../out/arch/arm64/boot/dtbo.img .
           fi
-          
-          # Update anykernel.sh
-          sed -i 's/kernel.string=.*/kernel.string=Realme Q5 (oscar) GKI Kernel/' anykernel.sh
-          sed -i 's/do.devicecheck=.*/do.devicecheck=1/' anykernel.sh
-          sed -i 's/device.name1=.*/device.name1=oscar/' anykernel.sh
-          sed -i 's/device.name2=.*/device.name2=RMX3478/' anykernel.sh
-          sed -i 's/block=.*/block=\/dev\/block\/bootdevice\/by-name\/boot/' anykernel.sh
-          sed -i 's/is_slot_device=.*/is_slot_device=1/' anykernel.sh
-          sed -i 's/is_oreo=.*/is_oreo=1/' anykernel.sh
-          
+
+          # Configure AnyKernel3
+          cat > anykernel.sh << 'ANYKERNEL'
+# AnyKernel3 Ramdisk Mod Script
+# osm0sis @ xda-developers
+
+## AnyKernel setup
+properties Kernel=true
+do.devicecheck=1
+device.name1=oscar
+device.name2=RMX3478
+device.name3=RMX3471
+device.name4=RMX3472
+device.name5=RMX3474
+block=/dev/block/bootdevice/by-name/boot
+is_slot_device=1
+ramdisk_compression=auto
+patch_vbmeta_flag=auto
+
+## AnyKernel file attributes
+is_slot_device=1
+ramdisk_compression=auto
+patch_vbmeta_flag=auto
+
+## AnyKernel install
+kernel.string=Realme Q5 (oscar) GKI Kernel by poying2018
+
+do.patch=0
+
+. tools/ak3-core.sh
+
+set_perm restore
+ANYKERNEL
+
           # Create zip
           TIMESTAMP=$(date +"%Y%m%d-%H%M")
           ZIP_NAME="RealmeQ5-GKI-Kernel-${TIMESTAMP}.zip"
-          zip -r9 "../$ZIP_NAME" . -x "*.git*"
-          
-          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
-          echo "=== Package complete: $ZIP_NAME ==="
+          zip -r9 "../${ZIP_NAME}" . -x "*.git*"
 
-      - name: Upload build artifact
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "Package: ${ZIP_NAME}"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: RealmeQ5-GKI-Kernel
-          path: build/${{ env.ZIP_NAME }}
-          retention-days: 30
+          path: kernel/AnyKernel3/../${{ env.ZIP_NAME }}
+          if-no-files-found: error
 
       - name: Create Release
         if: success()
         uses: ncipollo/release-action@v1
         with:
-          tag: RealmeQ5-GKI-$(date +%Y%m%d-%H%M)
-          name: "Realme Q5 GKI Kernel - ${{ github.event.inputs.lto_mode }} LTO"
-          artifacts: "build/${{ env.ZIP_NAME }}"
+          tag: RealmeQ5-GKI-$(date +%Y%m%d-%H%M%S)
+          name: "Realme Q5 GKI Kernel"
+          artifacts: "kernel/${{ env.ZIP_NAME }}"
           allowUpdates: true
-          removeArtifacts: false
-          replacesArtifacts: true
           token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## Realme Q5 (oscar) GKI Kernel
 
-      - name: Build summary
-        run: |
-          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Device**: ${{ env.DEVICE_NAME }} (${{ env.CODENAME }})" >> $GITHUB_STEP_SUMMARY
-          echo "- **SoC**: ${{ env.SOC }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Kernel Source**: ${{ env.KERNEL_SOURCE }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **KernelSU**: ${{ github.event.inputs.enable_kernelsu }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **LTO Mode**: ${{ github.event.inputs.lto_mode }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Build Time**: $(date)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Download" >> $GITHUB_STEP_SUMMARY
-          echo "Check the [Release](${{ github.server_url }}/${{ github.repository }}/releases) or [Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for the kernel zip." >> $GITHUB_STEP_SUMMARY
+            - **Codename**: oscar (SM6375)
+            - **Kernel**: android12-5.10
+            - **KernelSU**: ${{ github.event.inputs.enable_kernelsu }}
+            - **LTO**: ${{ github.event.inputs.lto_mode }}
+
+            ### Flash
+            ```bash
+            adb reboot recovery
+            adb sideload RealmeQ5-GKI-Kernel-*.zip
+            ```
