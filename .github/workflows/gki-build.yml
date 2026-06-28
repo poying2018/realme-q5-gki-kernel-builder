@@ -1,22 +1,10 @@
 name: Build GKI Kernel
 
 on:
+  push:
+    branches:
+      - master
   workflow_dispatch:
-    inputs:
-      enable_kernelsu:
-        description: Enable KernelSU
-        required: false
-        default: true
-        type: boolean
-      lto_mode:
-        description: LTO mode
-        required: false
-        default: thin
-        type: choice
-        options:
-        - thin
-        - full
-        - none
 
 jobs:
   build:
@@ -35,7 +23,6 @@ jobs:
     - name: Clone kernel
       run: git clone --depth=1 https://github.com/realme-kernel-opensource/realme_9pro-5G_9-5G_V25_Q5-AndroidS-kernel-source.git kernel
     - name: KernelSU
-      if: inputs.enable_kernelsu == true
       run: cd kernel && curl -LSs https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh | bash -
     - name: Configure
       run: |
